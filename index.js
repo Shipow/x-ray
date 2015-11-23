@@ -18,6 +18,7 @@ var fs = require('fs');
 
 var absolutes = require('./lib/absolutes');
 var resolve = require('./lib/resolve');
+var isAttr = require('./lib/is-attr');
 var params = require('./lib/params');
 var walk = require('./lib/walk');
 
@@ -49,9 +50,9 @@ function Xray() {
 
   function xray(source, scope, selector) {
     var args = params(source, scope, selector);
-    selector = args.selector;
     source = args.source;
-    scope = args.context;
+    scope = args.scope;
+    selector = args.selector;
 
     // state
     var state = assign({
@@ -65,14 +66,18 @@ function Xray() {
     var pages = [];
     var stream;
 
-    function node(source2, fn) {
-      if (1 == arguments.length) {
-        fn = source2;
-      } else {
-        source = source2;
+    function node(parent, fn) {
+      if (1 == arguments.length) { // Assume this is a root node
+        fn = parent;
+        parent = undefined;
+      }
+      else if (isUrl(parent) && !source) { // this is also a root node
+        source = parent;
+        parent = undefined;
       }
 
       debug('params: %j', {
+        parent: parent,
         source: source,
         scope: scope,
         selector: selector
@@ -85,25 +90,60 @@ function Xray() {
           var $ = load(html, source);
           node.html($, next);
         });
-      } else if (scope && ~scope.indexOf('@')) {
-        debug('resolving to a url: %s', scope)
-        var url = resolve(source, false, scope);
+      }
+      else if (isAttr(source)) {
+        debug('resolving to a url: %s', source);
 
-        // ensure that a@href is a URL
+        // dynamically resolved source must have a parent context
+        if (!parent) {
+          debug('source %s does not have a parent context!', source);
+          return next(new Error(source + ' requires a parent context for resolution'));
+        }
+        if (isUrl(parent)) {
+          // request the parent url passed in, then re-evaluate node with html parent
+          return xray.request(parent, function(err, html) {
+            if (err) return done(err);
+            var $ = load(html, parent);
+            node($, fn)
+          })
+        }
+
+        // ensure that attribute is a URL
+        var url = resolve(parent, false, source);
         if (!isUrl(url)) {
           debug('%s is not a url!', url);
           return next(new Error(url + ' is not a URL'));
         }
 
-        debug('resolved "%s" to a %s', scope, url);
-        xray.request(url, function(err, html) {
-          if (err) return next(err);
-          var $ = load(html, url);
-          node.html($, next);
-        });
-      } else {
-        // `url` is probably HTML
-        var $ = load(source);
+        if (isArray(url)) {
+          debug('resolved "%s" to array [%s]', source, url.join(', '));
+          var b = new Batch();
+          url.forEach(function(link) {
+            b.push(function(done) {
+              xray.request(link, function(err, html) {
+                if (err) return done(err);
+                var $ = load(html, link);
+                node.html($, done);
+              })
+            })
+          })
+          b.end(function(err, values) {
+            if (err) return next(err);
+            next(null, values);
+          })
+        }
+        else {
+          debug('resolved "%s" to a %s', source, url);
+          xray.request(url, function(err, html) {
+            if (err) return next(err);
+            var $ = load(html, url);
+            node.html($, next);
+          });
+        }
+      }
+      else {
+        if (parent && source) { throw new Error('Two sources of html provided. I don\'t know which to use!'); }
+        var $ = load(parent || source);
         node.html($, next);
       }
 
@@ -116,8 +156,8 @@ function Xray() {
         stream = stream
           ? stream
           : paginate
-          ? stream_array(state.stream)
-          : stream_object(state.stream);
+            ? stream_array(state.stream)
+            : stream_object(state.stream);
 
         if (paginate) {
           if (isArray(obj)) {
@@ -131,7 +171,6 @@ function Xray() {
             stream(obj, true);
             return fn(null, pages);
           }
-
           var url = resolve($, false, paginate);
           debug('paginate(%j) => %j', paginate, url);
 
@@ -162,51 +201,75 @@ function Xray() {
       return node;
     }
 
-    function load(html, url) {
-      var $ = html.html ? html : cheerio.load(html);
-      if (url) $ = absolutes(url, $);
-      return $;
-    }
-
     node.html = function($, fn) {
-      walk(selector, function(v, k, next) {
-        if ('string' == typeof v) {
-          var value = resolve($, root(scope), v);
-          return next(null, value);
-        } else if ('function' == typeof v) {
-          v($, function(err, obj) {
-            if (err) return next(err);
-            return next(null, obj);
+      if (scope && isArray(scope)) {
+        var single_scope = scope[0]
+        if ('string' != typeof single_scope) throw new Error('scope must be a string!')
+        var $single_scope = $.find ? $.find(single_scope) : $(single_scope);
+        var pending = $single_scope.length;
+        var out = [];
+        if (!pending) return fn(null, out);
+        $single_scope.each(function(i, el) {
+          var $innerscope = $single_scope.eq(i);
+          var node = xray(selector);
+          node($innerscope, function(err, obj) {
+            if (err) return fn(err);
+            out[i] = obj;
+            if (!--pending) {
+              return fn(null, compact(out));
+            }
           });
-        } else if (isArray(v)) {
-          if ('string' == typeof v[0]) {
-            return next(null, resolve($, root(scope), v));
-          } else if ('object' == typeof v[0]) {
-            var $scope = $.find ? $.find(scope) : $(scope);
-            var pending = $scope.length;
-            var out = [];
-
-            // Handle the empty result set (thanks @jenbennings!)
-            if (!pending) return next(null, out);
-
-            $scope.each(function(i, el) {
-              var $innerscope = $scope.eq(i);
-              var node = xray(scope, v[0]);
-              node($innerscope, function(err, obj) {
-                if (err) return next(err);
-                out[i] = obj;
-                if (!--pending) {
-                  return next(null, compact(out));
-                }
-              });
+        });
+      }
+      else {
+        walk(selector, function(v, k, next) {
+          if ('string' == typeof v) {
+            var value = resolve($, root(scope), v);
+            return next(null, value);
+          }
+          else if ('function' == typeof v) {
+            $scope = $.find ? $.find(scope) : $(scope)
+            v(scope ? $scope : $, function(err, obj) {
+              if (err) return next(err);
+              return next(null, obj);
             });
           }
-        }
-        return next();
-      }, function(err, obj) {
-        if (err) return fn(err);
-        fn(null, obj, $);
-      });
+          else if (isArray(v)) {
+            if ('string' == typeof v[0]) {
+              return next(null, resolve($, root(scope), v));
+            }
+            else if ('object' == typeof v[0] || 'function' == typeof v[0]) {
+              var $scope = $.find ? $.find(scope) : $(scope);
+              var pending = $scope.length;
+              var out = [];
+
+              // Handle the empty result set (thanks @jenbennings!)
+              if (!pending) return next(null, out);
+
+              $scope.each(function(i, el) {
+                var $innerscope = $scope.eq(i);
+                var node = 'object' == typeof v[0] ? xray(v[0]) : v[0];
+                node($innerscope, function(err, obj) {
+                  if (err) return next(err);
+                  out[i] = obj;
+                  if (!--pending) {
+                    return next(null, compact(out));
+                  }
+                });
+              });
+            }
+            else {
+              return next(null, []);
+            }
+          }
+          else {
+            return next();
+          }
+        }, function(err, obj) {
+          if (err) return fn(err);
+          fn(null, obj, $);
+        });
+      }
     }
 
     node.paginate = function(paginate) {
@@ -250,7 +313,7 @@ function Xray() {
     })
   }
 
-
+  // expose crawler methods
   methods.forEach(function(method) {
     xray[method] = function() {
       if (!arguments.length) return crawler[method]();
@@ -343,4 +406,13 @@ function stream_object(stream) {
       stream.write(json);
     }
   }
+}
+
+/**
+ * Load some html and resolve urls
+ */
+function load(html, url) {
+  var $ = html.html ? html : cheerio.load(html);
+  if (url) $ = absolutes(url, $);
+  return $;
 }
